@@ -1,4 +1,4 @@
-# Mutex
+# ![img](C:\Users\ensihpe\Desktop\Personal\study\goconcurrency\assets\5ayy6cd9ec9fe0bcc13113302056ac0b.jpg)Mutex
 
 ## 同步原语的使用场景
 
@@ -536,5 +536,308 @@ lock源码
             runtime_Semrelease(&m.sema, true, 1)
         }
     }
+```
+
+## mutex常见的易错场景
+
+### lock和unlock 没有成对出现
+
+### copy已经使用的mutex
+
+### 重入
+
+``` 
+重入概念
+当一个线程获取锁时，如果没有其它线程拥有这个锁，那么，这个线程就成功获取到这个锁。之后，如果其它线程再请求这个锁，就会处于阻塞等待的状态。但是，如果拥有这把锁的线程再请求这把锁的话，不会阻塞，而是成功返回，所以叫可重入锁（有时候也叫做递归锁）。只要你拥有这把锁，你可以可着劲儿地调用，比如通过递归实现一些算法，调用者不会阻塞或者死锁。
+```
+
+解决重入的两个方案：
+
+- 方案一：通过 hacker 的方式获取到 goroutine id，记录下获取锁的 goroutine id，它可以实现 Locker 接口
+- 方案二：调用 Lock/Unlock 方法时，由 goroutine 提供一个 token，用来标识它自己，而不是我们通过 hacker 的方式获取到 goroutine id，但是，这样一来，就不满足 Locker 接口了。
+
+方案一
+
+```go
+// RecursiveMutex 包装一个Mutex,实现可重入
+type RecursiveMutex struct {
+    sync.Mutex
+    owner     int64 // 当前持有锁的goroutine id
+    recursion int32 // 这个goroutine 重入的次数
+}
+
+func (m *RecursiveMutex) Lock() {
+    gid := goid.Get()
+    // 如果当前持有锁的goroutine就是这次调用的goroutine,说明是重入
+    if atomic.LoadInt64(&m.owner) == gid {
+        m.recursion++
+        return
+    }
+    m.Mutex.Lock()
+    // 获得锁的goroutine第一次调用，记录下它的goroutine id,调用次数加1
+    atomic.StoreInt64(&m.owner, gid)
+    m.recursion = 1
+}
+
+func (m *RecursiveMutex) Unlock() {
+    gid := goid.Get()
+    // 非持有锁的goroutine尝试释放锁，错误的使用
+    if atomic.LoadInt64(&m.owner) != gid {
+        panic(fmt.Sprintf("wrong the owner(%d): %d!", m.owner, gid))
+    }
+    // 调用次数减1
+    m.recursion--
+    if m.recursion != 0 { // 如果这个goroutine还没有完全释放，则直接返回
+        return
+    }
+    // 此goroutine最后一次调用，需要释放锁
+    atomic.StoreInt64(&m.owner, -1)
+    m.Mutex.Unlock()
+}
+```
+
+方案二，将goid替换成了token,其余的逻辑都是一样的，不详细展示。
+
+### 死锁
+
+死锁的概念
+
+```
+两个或两个以上的进程（或线程，goroutine）在执行过程中，因争夺共享资源而处于一种互相等待的状态，如果没有外部干涉，它们都将无法推进下去，此时，我们称系统处于死锁状态或系统产生了死锁。
+```
+
+产生死锁的条件，破坏其一就能破坏死锁
+
+```
+1. 互斥： 至少一个资源是被排他性独享的，其他线程必须处于等待状态，直到资源被释放。
+2. 持有和等待：goroutine 持有一个资源，并且还在请求其它 goroutine 持有的资源，也就是咱们常说的“吃着碗里，看着锅里”的意思。
+3. 不可剥夺：资源只能由持有它的 goroutine 来释放。
+4. 环路等待：一般来说，存在一组等待进程，P={P1，P2，…，PN}，P1 等待 P2 持有的资源，P2 等待 P3 持有的资源，依此类推，最后是 PN 等待 P1 持有的资源，这就形成了一个环路等待的死结。
+```
+
+``` go
+
+package main
+
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+
+func main() {
+    // 派出所证明
+    var psCertificate sync.Mutex
+    // 物业证明
+    var propertyCertificate sync.Mutex
+
+
+    var wg sync.WaitGroup
+    wg.Add(2) // 需要派出所和物业都处理
+
+
+    // 派出所处理goroutine
+    go func() {
+        defer wg.Done() // 派出所处理完成
+
+
+        psCertificate.Lock()
+        defer psCertificate.Unlock()
+
+
+        // 检查材料
+        time.Sleep(5 * time.Second)
+        // 请求物业的证明
+        propertyCertificate.Lock()
+        propertyCertificate.Unlock()
+    }()
+
+
+    // 物业处理goroutine
+    go func() {
+        defer wg.Done() // 物业处理完成
+
+
+        propertyCertificate.Lock()
+        defer propertyCertificate.Unlock()
+
+
+        // 检查材料
+        time.Sleep(5 * time.Second)
+        // 请求派出所的证明
+        psCertificate.Lock()
+        psCertificate.Unlock()
+    }()
+
+
+    wg.Wait()
+    fmt.Println("成功完成")
+}
+```
+
+## Mutex 的Hacker编程
+
+### 实现Trylock
+
+```
+概念：
+这个方法具体是什么意思呢？我来解释一下这里的逻辑。当一个 goroutine 调用这个 TryLock 方法请求锁的时候，如果这把锁没有被其他 goroutine 所持有，那么，这个 goroutine 就持有了这把锁，并返回 true；如果这把锁已经被其他 goroutine 所持有，或者是正在准备交给某个被唤醒的 goroutine，那么，这个请求锁的 goroutine 就直接返回 false，不会阻塞在方法调用上。
+```
+
+```go
+// 复制Mutex定义的常量
+const (
+    mutexLocked = 1 << iota // 加锁标识位置
+    mutexWoken              // 唤醒标识位置
+    mutexStarving           // 锁饥饿标识位置
+    mutexWaiterShift = iota // 标识waiter的起始bit位置
+)
+
+// 扩展一个Mutex结构
+type Mutex struct {
+    sync.Mutex
+}
+
+// 尝试获取锁
+func (m *Mutex) TryLock() bool {
+    // 如果能成功抢到锁
+    if atomic.CompareAndSwapInt32((*int32)(unsafe.Pointer(&m.Mutex)), 0, mutexLocked) {
+        return true
+    }
+
+    // 如果处于唤醒、加锁或者饥饿状态，这次请求就不参与竞争了，返回false
+    old := atomic.LoadInt32((*int32)(unsafe.Pointer(&m.Mutex)))
+    if old&(mutexLocked|mutexStarving|mutexWoken) != 0 {
+        return false
+    }
+
+    // 尝试在竞争的状态下请求锁
+    new := old | mutexLocked
+    return atomic.CompareAndSwapInt32((*int32)(unsafe.Pointer(&m.Mutex)), old, new)
+}
+```
+
+```go
+//  
+func try() {
+    var mu Mutex
+    go func() { // 启动一个goroutine持有一段时间的锁
+        mu.Lock()
+        time.Sleep(time.Duration(rand.Intn(2)) * time.Second)
+        mu.Unlock()
+    }()
+
+    time.Sleep(time.Second)
+
+    ok := mu.TryLock() // 尝试获取到锁
+    if ok { // 获取成功
+        fmt.Println("got the lock")
+        // do something
+        mu.Unlock()
+        return
+    }
+
+    // 没有获取到
+    fmt.Println("can't get the lock")
+}
+```
+
+### 实现获取锁的状态
+
+```go
+
+const (
+    mutexLocked = 1 << iota // mutex is locked
+    mutexWoken
+    mutexStarving
+    mutexWaiterShift = iota
+)
+
+type Mutex struct {
+    sync.Mutex
+}
+
+func (m *Mutex) Count() int {
+    // 获取state字段的值
+    v := atomic.LoadInt32((*int32)(unsafe.Pointer(&m.Mutex)))
+    v = v >> mutexWaiterShift //得到等待者的数值
+    v = v + (v & mutexLocked) //再加上锁持有者的数量，0或者1
+    return int(v)
+}
+
+
+// 锁是否被持有
+func (m *Mutex) IsLocked() bool {
+    state := atomic.LoadInt32((*int32)(unsafe.Pointer(&m.Mutex)))
+    return state&mutexLocked == mutexLocked
+}
+
+// 是否有等待者被唤醒
+func (m *Mutex) IsWoken() bool {
+    state := atomic.LoadInt32((*int32)(unsafe.Pointer(&m.Mutex)))
+    return state&mutexWoken == mutexWoken
+}
+
+// 锁是否处于饥饿状态
+func (m *Mutex) IsStarving() bool {
+    state := atomic.LoadInt32((*int32)(unsafe.Pointer(&m.Mutex)))
+    return state&mutexStarving == mutexStarving
+}
+
+
+// 测试代码
+
+func count() {
+    var mu Mutex
+    for i := 0; i < 1000; i++ { // 启动1000个goroutine
+        go func() {
+            mu.Lock()
+            time.Sleep(time.Second)
+            mu.Unlock()
+        }()
+    }
+
+    time.Sleep(time.Second)
+    // 输出锁的信息
+    fmt.Printf("waitings: %d, isLocked: %t, woken: %t,  starving: %t\n", mu.Count(), mu.IsLocked(), mu.IsWoken(), mu.IsStarving())
+}
+```
+
+
+
+### 使用Mutex实现线程安全的队列
+
+```go
+
+type SliceQueue struct {
+    data []interface{}
+    mu   sync.Mutex
+}
+
+func NewSliceQueue(n int) (q *SliceQueue) {
+    return &SliceQueue{data: make([]interface{}, 0, n)}
+}
+
+// Enqueue 把值放在队尾
+func (q *SliceQueue) Enqueue(v interface{}) {
+    q.mu.Lock()
+    q.data = append(q.data, v)
+    q.mu.Unlock()
+}
+
+// Dequeue 移去队头并返回
+func (q *SliceQueue) Dequeue() interface{} {
+    q.mu.Lock()
+    if len(q.data) == 0 {
+        q.mu.Unlock()
+        return nil
+    }
+    v := q.data[0]
+    q.data = q.data[1:]
+    q.mu.Unlock()
+    return v
+}
 ```
 
